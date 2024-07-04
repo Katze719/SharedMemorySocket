@@ -1,0 +1,308 @@
+import multiprocessing
+import time
+from . import shared_memory
+import enum
+import os
+import signal
+
+
+class MSG(enum.IntEnum):
+    REQUEST = signal.SIGUSR1
+    SUCCESS = signal.SIGUSR2
+
+
+class EventCode(enum.Enum):
+    NONE = 0x0
+    SAVE = 0x1
+    SAVE_WITH_MSG = 0x5
+    MSG = 0x2
+    PID = 0x3
+    HANDSHAKE = 0x4
+    RESTART_APP = 0x6
+    START_APP = 0x7
+    COMBINE_TEST_RESULTS = 0x1A
+    UNKNOWN = 0xFF
+
+
+class Conn:
+    __lock = multiprocessing.Lock()
+    __disabled = False
+
+    __shm_name_prefix = "pytest_resource_tracker_shm"
+
+    if not __disabled:
+        try:
+            __shm_conn_info = shared_memory.SharedMemory(
+                name=f"{__shm_name_prefix}_conn_info", track=False
+            )
+
+            __shm_client_msg = shared_memory.SharedMemory(
+                name=f"{__shm_name_prefix}_client_msg", track=False
+            )
+
+            __shm_event_code = shared_memory.SharedMemory(
+                name=f"{__shm_name_prefix}_event_code", track=False
+            )
+
+            __shm_answer_code = shared_memory.SharedMemory(
+                name=f"{__shm_name_prefix}_answer_code", track=False
+            )
+        except Exception:
+            __disabled = True
+            raise Exception("remoteResourceTracker is not startet with `--pytest-mode`")
+
+    @staticmethod
+    def disable(boolean: bool):
+        Conn.__disabled = boolean
+
+    @staticmethod
+    def __connect():
+        Conn.__shm_conn_info.buf[0] = 0x01
+
+    @staticmethod
+    def disconnect():
+        if Conn.__disabled:
+            return
+        Conn.__shm_conn_info.buf[0] = 0x00
+
+        Conn.__shm_conn_info.close()
+        Conn.__shm_client_msg.close()
+        Conn.__shm_event_code.close()
+        Conn.__shm_answer_code.close()
+
+    @staticmethod
+    def __write_client_message(message):
+        Conn.__shm_client_msg.buf[: len(message)] = message
+
+    @staticmethod
+    def __read_client_message():
+        message = Conn.__shm_client_msg.buf[:].tobytes().rstrip(b"\x00").decode()
+        Conn.__shm_client_msg.buf[:] = b"\x00" * (Conn.__shm_client_msg.size)
+        return message
+
+    @staticmethod
+    def __write_event_code(event_code: EventCode):
+        Conn.__shm_event_code.buf[0] = event_code.value
+
+    @staticmethod
+    def __read_answer_code() -> EventCode:
+        result = EventCode(Conn.__shm_answer_code.buf[0])
+        Conn.__shm_answer_code.buf[0] = 0x00
+        return result
+
+    @staticmethod
+    def send_code(event_code: EventCode):
+        if Conn.__disabled:
+            return
+        Conn.__request()
+        Conn.__write_event_code(event_code)
+        signal.pause()
+
+    @staticmethod
+    def save_as(message: str):
+        if Conn.__disabled:
+            return
+        Conn.__request()
+        Conn.__write_event_code(EventCode.SAVE_WITH_MSG)
+        Conn.__write_client_message(message.encode())
+        signal.pause()
+
+    @staticmethod
+    def connect():
+        if Conn.__disabled:
+            return
+        Conn.__set_response_handler()
+        Conn.__write_client_message(f"{os.getpid()}".encode())
+        Conn.__connect()
+        while Conn.__read_answer_code() is not EventCode.HANDSHAKE:
+            time.sleep(0.1)
+        Conn.server_pid = int(Conn.__read_client_message())
+
+    @staticmethod
+    def __request():
+        Conn.__lock.acquire()
+        os.kill(Conn.server_pid, MSG.REQUEST)
+
+    @staticmethod
+    def __success(signum, frame):
+        Conn.__lock.release()
+
+    @staticmethod
+    def __set_response_handler():
+        signal.signal(MSG.SUCCESS, Conn.__success)
+
+
+if __name__ == "__main__":
+    try:
+
+        Conn.connect()
+        Conn.save_as("hey")
+        Conn.send_code(EventCode.UNKNOWN)
+
+    except KeyboardInterrupt:
+        pass
+    Conn.disconnect()
+
+
+import time
+from . import shared_memory
+import enum
+import os
+import signal
+
+
+class MSG(enum.IntEnum):
+    REQUEST = signal.SIGUSR1
+    SUCCESS = signal.SIGUSR2
+
+
+class EventCode(enum.Enum):
+    NONE = 0x0
+    SAVE = 0x1
+    SAVE_WITH_MSG = 0x5
+    MSG = 0x2
+    PID = 0x3
+    HANDSHAKE = 0x4
+    RESTART_APP = 0x6
+    START_APP = 0x7
+    COMBINE_TEST_RESULTS = 0x1A
+    UNKNOWN = 0xFF
+
+
+class Serv:
+
+    __shm_name_prefix = "pytest_resource_tracker_shm"
+
+    __size_conn_info = 1
+    __shm_conn_info = shared_memory.SharedMemory(
+        name=f"{__shm_name_prefix}_conn_info",
+        create=True,
+        size=__size_conn_info,
+    )
+    __shm_conn_info.buf[:] = b"\x00" * __size_conn_info
+
+    __size_client_msg = 1024
+    __shm_client_msg = shared_memory.SharedMemory(
+        name=f"{__shm_name_prefix}_client_msg",
+        create=True,
+        size=__size_client_msg,
+    )
+    __shm_client_msg.buf[:] = b"\x00" * __size_client_msg
+
+    __size_msg_code = 1
+    __shm_msg_code = shared_memory.SharedMemory(
+        name=f"{__shm_name_prefix}_event_code",
+        create=True,
+        size=__size_msg_code,
+    )
+    __shm_msg_code.buf[:] = b"\x00" * __size_msg_code
+
+    __size_answer_code = 1
+    __shm_answer_code = shared_memory.SharedMemory(
+        name=f"{__shm_name_prefix}_answer_code",
+        create=True,
+        size=__size_answer_code,
+    )
+    __shm_answer_code.buf[:] = b"\x00" * __size_answer_code
+
+    __client_pid = None
+
+    @staticmethod
+    def free():
+        Serv.__shm_conn_info.close()
+        Serv.__shm_conn_info.unlink()
+
+        Serv.__shm_client_msg.close()
+        Serv.__shm_client_msg.unlink()
+
+        Serv.__shm_msg_code.close()
+        Serv.__shm_msg_code.unlink()
+
+        Serv.__shm_answer_code.close()
+        Serv.__shm_answer_code.unlink()
+
+    @staticmethod
+    def __read_client_message():
+        message = Serv.__shm_client_msg.buf[:].tobytes().rstrip(b"\x00").decode()
+        Serv.__shm_client_msg.buf[:] = b"\x00" * (Serv.__shm_client_msg.size)
+        return message
+
+    @staticmethod
+    def __read_msg_code() -> EventCode:
+        result = EventCode(Serv.__shm_msg_code.buf[0])
+        Serv.__shm_msg_code.buf[0] = 0x00
+        return result
+
+    @staticmethod
+    def __write_answer_code(answer_code: EventCode):
+        Serv.__shm_answer_code.buf[0] = answer_code.value
+
+    @staticmethod
+    def __write_client_message(message):
+        Serv.__shm_client_msg.buf[: len(message)] = message
+
+    @staticmethod
+    def is_client_connected() -> bool:
+        return bool(Serv.__shm_conn_info.buf[0])
+
+    @staticmethod
+    def accept_client():
+        while not Serv.is_client_connected():
+            time.sleep(0.1)
+        Serv.__client_pid = int(Serv.__read_client_message())
+        Serv.__write_client_message(f"{os.getpid()}".encode())
+        Serv.__write_answer_code(EventCode.HANDSHAKE)
+
+    @staticmethod
+    def __send_success():
+        os.kill(Serv.__client_pid, MSG.SUCCESS)
+
+    @staticmethod
+    def __receive_message():
+        client_msg = ""
+        while client_msg == "":
+            client_msg = Serv.__read_client_message()
+        return client_msg
+
+    @staticmethod
+    def __receive_code():
+        event_code = EventCode.NONE
+        while event_code is EventCode.NONE:
+            event_code = Serv.__read_msg_code()
+        return event_code
+
+    @staticmethod
+    def __request_handler(signum, frame):
+        code = Serv.__receive_code()
+        msg = ""
+        if code == EventCode.MSG or code == EventCode.SAVE_WITH_MSG:
+            msg = Serv.__receive_message()
+        Serv.__callback(code, msg)
+        Serv.__send_success()
+
+    @staticmethod
+    def set_event_handler(callback):
+        Serv.__callback = callback
+        signal.signal(MSG.REQUEST, Serv.__request_handler)
+
+
+def handle_event(event: EventCode, msg: str):
+    if event == EventCode.SAVE_WITH_MSG:
+        print(msg)
+    elif event == EventCode.UNKNOWN:
+        print(f"got: {event}")
+
+    time.sleep(5)
+
+
+if __name__ == "__main__":
+    Serv.set_event_handler(handle_event)
+    Serv.accept_client()
+
+    try:
+        while Serv.is_client_connected():
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        pass
+
+    Serv.free()
